@@ -14,7 +14,6 @@ services:
     depends_on:
       postgresdb:
         condition: service_healthy
-
   postgresdb:
     image: postgres
     restart: always

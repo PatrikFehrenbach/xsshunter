@@ -1,5 +1,4 @@
 const bcrypt = require('bcrypt');
-const openpgp = require('openpgp');
 const { Storage } = require('@google-cloud/storage');
 const express = require('express');
 const cors = require('cors');
@@ -28,7 +27,6 @@ const Sentry = require('@sentry/node');
 
 const SCREENSHOTS_DIR = path.resolve(process.env.SCREENSHOTS_DIR);
 const SCREENSHOT_FILENAME_REGEX = new RegExp(/^[0-9A-F]{8}-[0-9A-F]{4}-4[0-9A-F]{3}-[89AB][0-9A-F]{3}-[0-9A-F]{12}\.png$/i);
-const SCREENSHOT_FILENAME_REGEX_ENC = new RegExp(/^[0-9A-F]{8}-[0-9A-F]{4}-4[0-9A-F]{3}-[89AB][0-9A-F]{3}-[0-9A-F]{12}\.b64png.enc$/i);
 
 
 var sessions_middleware = false;
@@ -214,11 +212,11 @@ async function set_up_api_server(app) {
         const screenshot_filename = req.params.screenshotFilename;
 
         // Come correct or don't come at all.
-        if(!SCREENSHOT_FILENAME_REGEX.test(screenshot_filename) && !SCREENSHOT_FILENAME_REGEX_ENC.test(screenshot_filename)) {
+        if(!SCREENSHOT_FILENAME_REGEX.test(screenshot_filename)) {
             return res.sendStatus(404);
         }
 
-        const gz_image_path = `${screenshot_filename}.gz`;
+        var gz_image_path = `${screenshot_filename}.gz`;
 
         if (process.env.USE_CLOUD_STORAGE == "true"){
             const storage = new Storage();
@@ -231,21 +229,15 @@ async function set_up_api_server(app) {
                 const [image] = await file.download();
                 // Send the gzipped image in the response
                 res.set('Content-Encoding', 'gzip');
-                if(gz_image_path.endsWith(".b64png.enc.gz")){
-                    res.set('Content-Type', 'text/plain');
-                    res.setHeader('Content-disposition', 'attachment; filename=screenshot.b64png.enc');
-                    res.send(image);
-                }else{
-                    res.set('Content-Type', 'image/png');
-                    res.send(image);
-                }
+                res.set('Content-Type', 'image/png');
+                res.send(image);
             } catch (error) {
-                console.error(error.stack);
-                console.log("An error occurred looking up object")
+                console.error(error);
                 Sentry.captureException(error);
                 res.status(404).send(`Error retrieving image from GCS`);
             }
         }else{
+	    gz_image_path = `${SCREENSHOTS_DIR}/${gz_image_path}`;
             const image_exists = await check_file_exists(gz_image_path);
 
             if(!image_exists) {
@@ -400,28 +392,20 @@ async function set_up_api_server(app) {
     			},
                 user_id: req.session.user_id
     		},
-    		attributes: ['id', 'screenshot_id', 'encrypted']
+    		attributes: ['id', 'screenshot_id']
+    	});
+    	const screenshots_to_delete = screenshot_id_records.map(payload => {
+            const fileName = `${payload.screenshot_id}.png.gz`;
+    		return fileName;
     	});
         if ( process.env.USE_CLOUD_STORAGE == "true"){ 
             const storage = new Storage();
-            await Promise.all(screenshot_id_records.map(payload => {
-                let filename = ""
-                if(payload.encrypted){
-                    filename = `${payload.screenshot_id}.b64png.enc.gz`
-                }else{
-                    filename = `${payload.screenshot_id}.png.gz`;
-                }
-                return storage.bucket(process.env.BUCKET_NAME).file(filename).delete();
+            await Promise.all(screenshots_to_delete.map(screenshot_path => {
+                return storage.bucket(process.env.BUCKET_NAME).file(screenshot_path).delete();
             }));
         }else{
-            await Promise.all(screenshot_id_records.map(payload => {
-                let filename = "${SCREENSHOTS_DIR}/"
-                if(payload.encrypted){
-                    filename = `${payload.screenshot_id}.b64png.enc.gz`
-                }else{
-                    fileName = `${payload.screenshot_id}.png.gz`;
-                }
-                return asyncfs.unlink(filename);
+            await Promise.all(screenshots_to_delete.map(screenshot_path => {
+                return asyncfs.unlink(`${SCREENSHOTS_DIR}/${screenshot_path}`);
             }));
         }
     	const payload_fires = await PayloadFireResults.destroy({
@@ -497,9 +481,6 @@ async function set_up_api_server(app) {
                 "gitExposed": payload.gitExposed,
                 "createdAt": payload.createdAt,
                 "id": payload.id,
-                "encrypted": payload.encrypted,
-                "encrypted_data": payload.encrypted_data,
-                "public_key": payload.public_key,
                 "updatedAt": payload.updatedAt,
                 "secrets": payload_secrets
             }
@@ -667,7 +648,6 @@ async function set_up_api_server(app) {
         }
         returnObj.correlation_api_key = user.injectionCorrelationAPIKey;
         returnObj.chainload_uri = user.additionalJS;
-        returnObj.pgp_key = user.pgp_key;
         returnObj.send_alert_emails = user.sendEmailAlerts;
        
         res.status(200).json({
@@ -728,24 +708,10 @@ async function set_up_api_server(app) {
             user.additionalJS = null;
         }
 
-        if(req.body.pgp_key){
-            try{
-                const publicKey = await openpgp.readKey({ armoredKey: req.body.pgp_key });
-            }catch(e){
-                console.log(e.stack);
-                return res.status(400).json({
-                    'status': false,
-                    'error': 'invalid PGP key'
-                }).end();
-            }
-            user.pgp_key = req.body.pgp_key;
-        }else if(req.body.pgp_key === ""){
-            user.pgp_key = null;
-        }
-
         if(req.body.send_alert_emails !== undefined) {
             user.sendEmailAlerts = req.body.send_alert_emails;
         }
+
         await user.save();
 
         res.status(200).json({
